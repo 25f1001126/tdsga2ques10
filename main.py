@@ -1,77 +1,121 @@
+from fastapi import FastAPI, Request, Response
+from starlette.middleware.base import BaseHTTPMiddleware
+from collections import defaultdict, deque
+import time
+import uuid
 import os
 
-from fastapi import FastAPI, Request
-from starlette.middleware.cors import CORSMiddleware
+app = FastAPI()
 
-from app.middleware import RequestContextMiddleware, RateLimitMiddleware
-
-# --------------------------------------------------------------------------
+# =========================
 # Config
-# --------------------------------------------------------------------------
+# =========================
 
-ASSIGNED_ORIGIN = "https://app-wg66hi.example.com"
+ALLOWED_ORIGIN = "https://app-wg66hi.example.com"
 
-# The exam/grader page origin is NOT known at build time -> set it via env var
-# when you deploy, e.g.  EXAM_ORIGIN=https://grader.example.org
-EXAM_ORIGIN = os.getenv("EXAM_ORIGIN", "").strip()
+# Must allow exam page origin (set explicitly or via env in real deployments)
+EXAM_ORIGIN = os.getenv("EXAM_ORIGIN", "https://exam.example.com")
 
-# Comma-separated list for any additional origins you need to allow.
-EXTRA_ALLOWED_ORIGINS = [
-    o.strip() for o in os.getenv("EXTRA_ALLOWED_ORIGINS", "").split(",") if o.strip()
-]
+RATE_LIMIT_B = 12          # 12 requests
+RATE_LIMIT_WINDOW = 10     # per 10 seconds
 
-ALLOWED_ORIGINS = [ASSIGNED_ORIGIN]
-if EXAM_ORIGIN:
-    ALLOWED_ORIGINS.append(EXAM_ORIGIN)
-ALLOWED_ORIGINS.extend(EXTRA_ALLOWED_ORIGINS)
-# De-dupe while preserving order.
-ALLOWED_ORIGINS = list(dict.fromkeys(ALLOWED_ORIGINS))
+LOGIN_EMAIL = os.getenv("LOGIN_EMAIL", "user@example.com")
 
-RATE_LIMIT_MAX = int(os.getenv("RATE_LIMIT_MAX", "12"))       # B = 12 requests
-RATE_LIMIT_WINDOW = float(os.getenv("RATE_LIMIT_WINDOW", "10"))  # per 10 seconds
 
-SERVICE_EMAIL = os.getenv("SERVICE_EMAIL", "you@example.com")  # <-- set this to your real address
+# =========================
+# Middleware 1: Request Context
+# =========================
 
-# --------------------------------------------------------------------------
-# App + middleware stack
-# --------------------------------------------------------------------------
+class RequestContextMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = request.headers.get("X-Request-ID")
 
-app = FastAPI(title="ping-service")
+        if not request_id:
+            request_id = str(uuid.uuid4())
 
-# IMPORTANT: Starlette wraps middleware so that the LAST one added via
-# add_middleware() ends up OUTERMOST (it runs first on the way in, last on
-# the way out). We want:
-#
-#   request  -> CORS -> RequestContext -> RateLimit -> route handler
-#   response <- CORS <- RequestContext <- RateLimit <- route handler
-#
-# so CORS can short-circuit preflight OPTIONS requests before anything else
-# runs, and every response (including 429s) still carries X-Request-ID and,
-# if applicable, the CORS headers. To get that order we add innermost first:
+        # store in request state
+        request.state.request_id = request_id
 
-app.add_middleware(
-    RateLimitMiddleware,
-    max_requests=RATE_LIMIT_MAX,
-    window_seconds=RATE_LIMIT_WINDOW,
-)
+        response = await call_next(request)
+
+        # propagate
+        response.headers["X-Request-ID"] = request_id
+        return response
+
+
+# =========================
+# Middleware 2: Rate Limiter
+# =========================
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    def __init__(self, app):
+        super().__init__(app)
+        self.clients = defaultdict(deque)  # client_id -> timestamps
+
+    async def dispatch(self, request: Request, call_next):
+        client_id = request.headers.get("X-Client-Id", "anonymous")
+
+        now = time.time()
+        window_start = now - RATE_LIMIT_WINDOW
+
+        q = self.clients[client_id]
+
+        # remove old timestamps
+        while q and q[0] < window_start:
+            q.popleft()
+
+        if len(q) >= RATE_LIMIT_B:
+            return Response(
+                content="Too Many Requests",
+                status_code=429
+            )
+
+        q.append(now)
+
+        return await call_next(request)
+
+
+# =========================
+# Middleware 3: Scoped CORS
+# =========================
+
+class ScopedCORSMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        origin = request.headers.get("origin")
+
+        # Handle preflight
+        if request.method == "OPTIONS":
+            resp = Response(status_code=204)
+        else:
+            resp = await call_next(request)
+
+        allowed = {ALLOWED_ORIGIN, EXAM_ORIGIN}
+
+        if origin in allowed:
+            resp.headers["Access-Control-Allow-Origin"] = origin
+            resp.headers["Vary"] = "Origin"
+            resp.headers["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+            resp.headers["Access-Control-Allow-Headers"] = "X-Client-Id, X-Request-ID, Content-Type"
+
+        return resp
+
+
+# =========================
+# Register middleware (order matters)
+# =========================
+
+app.add_middleware(ScopedCORSMiddleware)
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(RequestContextMiddleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,   # explicit list -> never "*"
-    allow_credentials=False,
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["*", "X-Client-Id", "X-Request-ID"],
-    expose_headers=["X-Request-ID"],  # so browser JS can read it cross-origin
-)
 
 
-# --------------------------------------------------------------------------
-# Route
-# --------------------------------------------------------------------------
+# =========================
+# Endpoint
+# =========================
 
 @app.get("/ping")
 async def ping(request: Request):
     return {
-        "email": SERVICE_EMAIL,
-        "request_id": request.state.request_id,
+        "email": LOGIN_EMAIL,
+        "request_id": request.state.request_id
     }
