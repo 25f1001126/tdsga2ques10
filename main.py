@@ -70,17 +70,24 @@ def allowed(client_id: str):
 
 @app.middleware("http")
 async def rate_limit(request: Request, call_next):
+    # Never rate-limit CORS preflight — let CORSMiddleware handle it
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     client = request.headers.get("X-Client-Id", "anonymous")
-
     ok, retry = allowed(client)
-
     if not ok:
+        origin = request.headers.get("origin", "*")
         return JSONResponse(
             status_code=429,
-            headers={"Retry-After": str(retry)},
+            headers={
+                "Retry-After": str(retry),
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Credentials": "false",
+                "Access-Control-Expose-Headers": "Retry-After",
+            },
             content={"detail": "Rate limit exceeded"},
         )
-
     return await call_next(request)
 
 
