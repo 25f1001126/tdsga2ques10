@@ -23,8 +23,8 @@ from fastapi.responses import JSONResponse
 # --------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------
-TOTAL_ORDERS = 40
-RATE_LIMIT = 17
+TOTAL_ORDERS = 59
+RATE_LIMIT = 16
 RATE_WINDOW_SECS = 10
 
 app = FastAPI(title="Orders API")
